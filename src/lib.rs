@@ -1,404 +1,309 @@
-//! Linux monolithic kernel ABI and syscall emulation
-//!
-//! Subsystem component of SigmaOS following core architectural principles:
-//! DRY, KISS, SOLID, AAA testing, Separation of Concerns, Gall's Law.
+#![forbid(unsafe_code)]
+#![deny(clippy::all)]
 
-/// Configuration contract for SigmaOS-kernel-linux
-#[derive(Debug, Clone, PartialEq)]
-pub struct Config {
-    pub enabled: bool,
-    pub component_name: String,
-    pub tier: u8,
+//! Linux kernel ABI / syscall emulation layer for SigmaOS.
+
+use std::fmt;
+
+// ---------------------------------------------------------------------------
+// Syscall enum
+// ---------------------------------------------------------------------------
+
+/// Linux syscall numbers (x86-64 ABI).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum Syscall {
+    Read = 0,
+    Write = 1,
+    Open = 2,
+    Close = 3,
+    Stat = 4,
+    Fstat = 5,
+    Mmap = 9,
+    Munmap = 11,
+    Brk = 12,
+    Getpid = 39,
+    Socket = 41,
+    Connect = 42,
+    Accept = 43,
+    Sendto = 44,
+    Recvfrom = 45,
+    Fork = 57,
+    Execve = 59,
+    Exit = 60,
+    Wait4 = 61,
+    Kill = 62,
+    Getuid = 102,
 }
 
-impl Default for Config {
+// ---------------------------------------------------------------------------
+// SyscallError
+// ---------------------------------------------------------------------------
+
+/// Errors that a syscall dispatch can return, mapping to standard errno values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyscallError {
+    PermissionDenied,
+    NoSuchFile,
+    InvalidArgument,
+    OutOfMemory,
+    Interrupted,
+    TryAgain,
+    NotSupported,
+}
+
+impl SyscallError {
+    /// Convert this error to the corresponding POSIX errno integer.
+    pub fn to_errno(self) -> i32 {
+        match self {
+            Self::PermissionDenied => 13, // EACCES
+            Self::NoSuchFile => 2,        // ENOENT
+            Self::InvalidArgument => 22,  // EINVAL
+            Self::OutOfMemory => 12,      // ENOMEM
+            Self::Interrupted => 4,       // EINTR
+            Self::TryAgain => 11,         // EAGAIN
+            Self::NotSupported => 38,     // ENOSYS
+        }
+    }
+}
+
+impl fmt::Display for SyscallError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "errno {}: {:?}", self.to_errno(), self)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SyscallResult
+// ---------------------------------------------------------------------------
+
+/// Return type for every dispatched syscall.
+pub type SyscallResult = Result<i64, SyscallError>;
+
+// ---------------------------------------------------------------------------
+// KernelAbi
+// ---------------------------------------------------------------------------
+
+/// Represents the kernel ABI contract exposed to user-space.
+#[derive(Debug)]
+pub struct KernelAbi {
+    /// Target architecture string.
+    pub arch: &'static str,
+    /// ABI version number.
+    pub abi_version: u32,
+    /// System page size in bytes.
+    pub page_size: usize,
+}
+
+impl Default for KernelAbi {
     fn default() -> Self {
-        Config {
-            enabled: true,
-            component_name: String::from("SigmaOS-kernel-linux"),
-            tier: 1,
+        Self {
+            arch: "x86_64",
+            abi_version: 5,
+            page_size: 4096,
         }
     }
 }
 
-/// State descriptor for SigmaOS-kernel-linux
-#[derive(Debug, Clone, PartialEq)]
-pub struct State {
-    pub initialized: bool,
-    pub healthy: bool,
-}
+impl KernelAbi {
+    /// Create a new `KernelAbi` with default x86-64 constants.
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-/// Lifecycle supervisor for SigmaOS-kernel-linux
-pub struct Supervisor {
-    config: Config,
-    state: State,
-}
+    /// Dispatch a syscall with the given arguments.
+    ///
+    /// Returns a stub result for every recognised syscall; returns
+    /// `Err(SyscallError::NotSupported)` for any unimplemented path that
+    /// would require real kernel interaction.
+    pub fn dispatch(&self, syscall: Syscall, args: &[u64]) -> SyscallResult {
+        match syscall {
+            // --- I/O ---
+            Syscall::Read => {
+                // args: fd, buf_ptr, count
+                let count = args.get(2).copied().unwrap_or(0);
+                if count == 0 {
+                    Ok(0)
+                } else {
+                    // Emulated: no real fd table yet
+                    Err(SyscallError::NotSupported)
+                }
+            }
+            Syscall::Write => {
+                // args: fd, buf_ptr, count
+                let count = args.get(2).copied().unwrap_or(0) as i64;
+                if count < 0 {
+                    Err(SyscallError::InvalidArgument)
+                } else {
+                    Ok(count) // report all bytes "written"
+                }
+            }
+            Syscall::Open => Err(SyscallError::NotSupported),
+            Syscall::Close => Ok(0),
 
-impl Supervisor {
-    /// Create a new supervisor instance
-    pub fn new(config: Config) -> Self {
-        Supervisor {
-            config,
-            state: State {
-                initialized: false,
-                healthy: true,
-            },
+            // --- File metadata ---
+            Syscall::Stat | Syscall::Fstat => Err(SyscallError::NotSupported),
+
+            // --- Memory management ---
+            Syscall::Mmap => {
+                // Stub: cannot allocate real pages without unsafe
+                Err(SyscallError::NotSupported)
+            }
+            Syscall::Munmap => Ok(0),
+            Syscall::Brk => {
+                // Return the requested address as the new break
+                Ok(args.first().copied().unwrap_or(0) as i64)
+            }
+
+            // --- Process ---
+            Syscall::Getpid => Ok(1), // PID 1 in emulation
+            Syscall::Getuid => Ok(0), // root uid in emulation
+            Syscall::Fork => Err(SyscallError::NotSupported),
+            Syscall::Execve => Err(SyscallError::NotSupported),
+            Syscall::Exit => Ok(args.first().copied().unwrap_or(0) as i64),
+            Syscall::Wait4 => Err(SyscallError::NotSupported),
+            Syscall::Kill => {
+                let sig = args.get(1).copied().unwrap_or(0);
+                if sig == 0 {
+                    Ok(0)
+                } else {
+                    Err(SyscallError::PermissionDenied)
+                }
+            }
+
+            // --- Networking ---
+            Syscall::Socket => Err(SyscallError::NotSupported),
+            Syscall::Connect => Err(SyscallError::NotSupported),
+            Syscall::Accept => Err(SyscallError::NotSupported),
+            Syscall::Sendto => Err(SyscallError::NotSupported),
+            Syscall::Recvfrom => Err(SyscallError::NotSupported),
         }
     }
+}
 
-    /// Start and initialize the component
-    pub fn initialize(&mut self) -> Result<String, String> {
-        if !self.config.enabled {
-            return Err(String::from("Component is administratively disabled"));
-        }
-        self.state.initialized = true;
-        Ok(format!("{} initialized successfully at tier {}", self.config.component_name, self.config.tier))
-    }
+// ---------------------------------------------------------------------------
+// errno helpers
+// ---------------------------------------------------------------------------
 
-    /// Query current health
-    pub fn is_healthy(&self) -> bool {
-        self.state.initialized && self.state.healthy
+/// Return a human-readable description for a POSIX errno value.
+pub fn errno_to_str(errno: i32) -> &'static str {
+    match errno {
+        1 => "EPERM: Operation not permitted",
+        2 => "ENOENT: No such file or directory",
+        4 => "EINTR: Interrupted system call",
+        9 => "EBADF: Bad file descriptor",
+        11 => "EAGAIN: Resource temporarily unavailable",
+        12 => "ENOMEM: Out of memory",
+        13 => "EACCES: Permission denied",
+        14 => "EFAULT: Bad address",
+        17 => "EEXIST: File exists",
+        22 => "EINVAL: Invalid argument",
+        28 => "ENOSPC: No space left on device",
+        32 => "EPIPE: Broken pipe",
+        38 => "ENOSYS: Function not implemented",
+        _ => "Unknown errno",
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // Helper to build a default ABI instance
+    fn abi() -> KernelAbi {
+        KernelAbi::new()
+    }
+
+    // --- AAA Test 1: dispatch read with count=0 returns Ok(0) ---
     #[test]
-    fn test_default_configuration() {
+    fn test_dispatch_read_zero_count() {
         // Arrange
-        let config = Config::default();
+        let kernel = abi();
+        let args = [3u64, 0xDEAD_BEEF, 0]; // fd=3, buf=..., count=0
 
         // Act
-        let is_enabled = config.enabled;
-        let tier_val = config.tier;
+        let result = kernel.dispatch(Syscall::Read, &args);
 
         // Assert
-        assert!(is_enabled, "component must be enabled by default");
-        assert_eq!(tier_val, 1, "tier must match component contract");
+        assert_eq!(result, Ok(0));
     }
 
+    // --- AAA Test 2: dispatch write returns byte count ---
     #[test]
-    fn test_successful_initialization() {
+    fn test_dispatch_write_returns_count() {
         // Arrange
-        let config = Config::default();
-        let mut supervisor = Supervisor::new(config);
+        let kernel = abi();
+        let args = [1u64, 0xDEAD_BEEF, 42]; // fd=1 (stdout), buf=..., count=42
 
         // Act
-        let result = supervisor.initialize();
+        let result = kernel.dispatch(Syscall::Write, &args);
 
         // Assert
-        assert!(result.is_ok(), "initialization should succeed with valid config");
-        assert!(supervisor.is_healthy(), "component should report healthy state after init");
+        assert_eq!(result, Ok(42));
     }
 
+    // --- AAA Test 3: SyscallError converts to correct errno values ---
     #[test]
-    fn test_disabled_initialization_failure() {
+    fn test_error_to_errno_values() {
+        // Arrange / Act / Assert (table-driven)
+        assert_eq!(SyscallError::PermissionDenied.to_errno(), 13);
+        assert_eq!(SyscallError::NoSuchFile.to_errno(), 2);
+        assert_eq!(SyscallError::InvalidArgument.to_errno(), 22);
+        assert_eq!(SyscallError::OutOfMemory.to_errno(), 12);
+        assert_eq!(SyscallError::Interrupted.to_errno(), 4);
+        assert_eq!(SyscallError::TryAgain.to_errno(), 11);
+        assert_eq!(SyscallError::NotSupported.to_errno(), 38);
+    }
+
+    // --- AAA Test 4: KernelAbi constants are correct ---
+    #[test]
+    fn test_kernel_abi_constants() {
         // Arrange
-        let config = Config {
-            enabled: false,
-            component_name: String::from("SigmaOS-kernel-linux"),
-            tier: 1,
-        };
-        let mut supervisor = Supervisor::new(config);
+        let kernel = abi();
+
+        // Act + Assert
+        assert_eq!(kernel.arch, "x86_64");
+        assert_eq!(kernel.abi_version, 5);
+        assert_eq!(kernel.page_size, 4096);
+    }
+
+    // --- AAA Test 5: errno_to_str maps known values ---
+    #[test]
+    fn test_errno_to_str_known() {
+        // Arrange / Act / Assert
+        assert!(errno_to_str(2).contains("ENOENT"));
+        assert!(errno_to_str(12).contains("ENOMEM"));
+        assert!(errno_to_str(22).contains("EINVAL"));
+        assert!(errno_to_str(13).contains("EACCES"));
+    }
+
+    // --- AAA Test 6: errno_to_str returns fallback for unknown ---
+    #[test]
+    fn test_errno_to_str_unknown() {
+        // Arrange
+        let unknown = 9999;
 
         // Act
-        let result = supervisor.initialize();
+        let description = errno_to_str(unknown);
 
         // Assert
-        assert!(result.is_err(), "disabled component should reject initialization");
-        assert!(!supervisor.is_healthy(), "disabled component must not be marked healthy");
-    }
-}
-
-// =========================================================================
-// ARCH LINUX KERNEL ARCHITECTURE & KCONFIG EXTENSIONS
-// =========================================================================
-
-use std::collections::BTreeMap;
-
-/// Linux Kernel Version descriptor (e.g. `6.8.9-arch1-1`)
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct KernelVersion {
-    pub major: u32,
-    pub minor: u32,
-    pub patch: u32,
-    pub extraversion: String,
-}
-
-impl KernelVersion {
-    pub fn new(major: u32, minor: u32, patch: u32, extraversion: &str) -> Self {
-        Self {
-            major,
-            minor,
-            patch,
-            extraversion: extraversion.to_string(),
-        }
+        assert_eq!(description, "Unknown errno");
     }
 
-    pub fn parse(s: &str) -> Option<Self> {
-        let (ver_part, extra) = if let Some(dash) = s.find('-') {
-            (&s[..dash], &s[dash + 1..])
-        } else {
-            (s, "")
-        };
-
-        let parts: Vec<&str> = ver_part.split('.').collect();
-        if parts.len() < 2 {
-            return None;
-        }
-
-        let major = parts[0].parse::<u32>().ok()?;
-        let minor = parts[1].parse::<u32>().ok()?;
-        let patch = if parts.len() >= 3 {
-            parts[2].parse::<u32>().ok()?
-        } else {
-            0
-        };
-
-        Some(Self {
-            major,
-            minor,
-            patch,
-            extraversion: extra.to_string(),
-        })
-    }
-
-    /// Long Term Support (LTS) kernel series checker
-    pub fn is_lts(&self) -> bool {
-        match (self.major, self.minor) {
-            (6, 1) | (6, 6) | (6, 12) | (5, 15) | (5, 10) | (5, 4) => true,
-            _ => false,
-        }
-    }
-
-    pub fn format_uname(&self) -> String {
-        if self.extraversion.is_empty() {
-            format!("{}.{}.{}", self.major, self.minor, self.patch)
-        } else {
-            format!("{}.{}.{}-{}", self.major, self.minor, self.patch, self.extraversion)
-        }
-    }
-}
-
-/// Kconfig option values (matches Linux kernel `.config` formats)
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KernelConfigValue {
-    Yes,
-    No,
-    Module,
-    Value(String),
-}
-
-/// Linux `.config` configuration manager
-#[derive(Debug, Clone, Default)]
-pub struct KernelConfig {
-    options: BTreeMap<String, KernelConfigValue>,
-}
-
-impl KernelConfig {
-    pub fn new() -> Self {
-        Self {
-            options: BTreeMap::new(),
-        }
-    }
-
-    pub fn set(&mut self, key: &str, val: KernelConfigValue) {
-        self.options.insert(key.to_string(), val);
-    }
-
-    pub fn get(&self, key: &str) -> Option<&KernelConfigValue> {
-        self.options.get(key)
-    }
-
-    pub fn is_enabled(&self, key: &str) -> bool {
-        matches!(self.options.get(key), Some(KernelConfigValue::Yes))
-    }
-
-    pub fn is_module(&self, key: &str) -> bool {
-        matches!(self.options.get(key), Some(KernelConfigValue::Module))
-    }
-
-    pub fn parse_config(&mut self, content: &str) {
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if trimmed.starts_with("# CONFIG_") && trimmed.ends_with("is not set") {
-                let parts: Vec<&str> = trimmed.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    let key = parts[1];
-                    self.options.insert(key.to_string(), KernelConfigValue::No);
-                }
-                continue;
-            }
-            if trimmed.starts_with('#') {
-                continue;
-            }
-            if let Some((key, val)) = trimmed.split_once('=') {
-                let parsed_val = match val {
-                    "y" => KernelConfigValue::Yes,
-                    "m" => KernelConfigValue::Module,
-                    "n" => KernelConfigValue::No,
-                    other => {
-                        let stripped = other.trim_matches('"');
-                        KernelConfigValue::Value(stripped.to_string())
-                    }
-                };
-                self.options.insert(key.to_string(), parsed_val);
-            }
-        }
-    }
-}
-
-/// Subsystems present in the modular Linux monolithic kernel
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum KernelSubsystem {
-    Networking,
-    Storage,
-    Usb,
-    Pci,
-    Acpi,
-    Drm,
-    Sound,
-    Bluetooth,
-    Wireless,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubsystemState {
-    Disabled,
-    Builtin,
-    ModuleLoaded,
-    Unloaded,
-}
-
-/// Dynamic subsystem orchestrator
-#[derive(Debug, Clone, Default)]
-pub struct SubsystemLoader {
-    states: BTreeMap<KernelSubsystem, SubsystemState>,
-}
-
-impl SubsystemLoader {
-    pub fn new() -> Self {
-        let mut states = BTreeMap::new();
-        // Core buses default to builtin
-        states.insert(KernelSubsystem::Pci, SubsystemState::Builtin);
-        states.insert(KernelSubsystem::Acpi, SubsystemState::Builtin);
-        states.insert(KernelSubsystem::Storage, SubsystemState::Builtin);
-        states.insert(KernelSubsystem::Networking, SubsystemState::Builtin);
-        // Peripherals default to unloaded
-        states.insert(KernelSubsystem::Usb, SubsystemState::Unloaded);
-        states.insert(KernelSubsystem::Drm, SubsystemState::Unloaded);
-        states.insert(KernelSubsystem::Sound, SubsystemState::Unloaded);
-        states.insert(KernelSubsystem::Bluetooth, SubsystemState::Disabled);
-        states.insert(KernelSubsystem::Wireless, SubsystemState::Unloaded);
-
-        Self { states }
-    }
-
-    pub fn load(&mut self, sub: KernelSubsystem) -> Result<(), &'static str> {
-        match self.states.get(&sub) {
-            Some(SubsystemState::Builtin) => Ok(()),
-            Some(SubsystemState::Disabled) => Err("Subsystem is disabled in kernel config"),
-            Some(SubsystemState::ModuleLoaded) => Ok(()),
-            Some(SubsystemState::Unloaded) => {
-                self.states.insert(sub, SubsystemState::ModuleLoaded);
-                Ok(())
-            }
-            None => Err("Unknown subsystem"),
-        }
-    }
-
-    pub fn unload(&mut self, sub: KernelSubsystem) -> Result<(), &'static str> {
-        match self.states.get(&sub) {
-            Some(SubsystemState::Builtin) => Err("Cannot unload builtin kernel subsystem"),
-            Some(SubsystemState::ModuleLoaded) => {
-                self.states.insert(sub, SubsystemState::Unloaded);
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
-
-    pub fn is_operational(&self, sub: KernelSubsystem) -> bool {
-        matches!(self.states.get(&sub), Some(SubsystemState::Builtin) | Some(SubsystemState::ModuleLoaded))
-    }
-}
-
-#[cfg(test)]
-mod arch_kernel_tests {
-    use super::*;
-
-    // --- AAA Pattern: Kernel Version Parsing & LTS Check ---
+    // --- AAA Test 7: Syscall enum numeric values are correct ---
     #[test]
-    fn test_kernel_version_parsing_and_lts() {
-        // Arrange
-        let arch_kernel = "6.6.28-1-lts";
-        let zen_kernel = "6.8.9-zen1-1-zen";
-
-        // Act
-        let v_lts = KernelVersion::parse(arch_kernel).unwrap();
-        let v_zen = KernelVersion::parse(zen_kernel).unwrap();
-
-        // Assert
-        assert!(v_lts.is_lts(), "6.6 must be identified as LTS");
-        assert_eq!(v_lts.format_uname(), "6.6.28-1-lts");
-
-        assert!(!v_zen.is_lts(), "6.8 is not an LTS release");
-        assert_eq!(v_zen.major, 6);
-        assert_eq!(v_zen.minor, 8);
-        assert_eq!(v_zen.patch, 9);
-    }
-
-    // --- AAA Pattern: Kconfig Parser ---
-    #[test]
-    fn test_kernel_config_parser() {
-        // Arrange
-        let mut kconfig = KernelConfig::new();
-        let raw_config = r#"
-# Linux/x86_64 6.8.9 Kernel Configuration
-CONFIG_64BIT=y
-CONFIG_SMP=y
-CONFIG_BTRFS_FS=m
-CONFIG_EXT4_FS=y
-# CONFIG_USB_STORAGE is not set
-CONFIG_DEFAULT_HOSTNAME="sigmaos"
-"#;
-
-        // Act
-        kconfig.parse_config(raw_config);
-
-        // Assert
-        assert!(kconfig.is_enabled("CONFIG_64BIT"));
-        assert!(kconfig.is_enabled("CONFIG_SMP"));
-        assert!(kconfig.is_module("CONFIG_BTRFS_FS"));
-        assert_eq!(kconfig.get("CONFIG_USB_STORAGE"), Some(&KernelConfigValue::No));
-        assert_eq!(
-            kconfig.get("CONFIG_DEFAULT_HOSTNAME"),
-            Some(&KernelConfigValue::Value("sigmaos".to_string()))
-        );
-    }
-
-    // --- AAA Pattern: Subsystem Loader Lifecycle ---
-    #[test]
-    fn test_subsystem_loader_lifecycle() {
-        // Arrange
-        let mut loader = SubsystemLoader::new();
-
-        // Act & Assert Builtin
-        assert!(loader.is_operational(KernelSubsystem::Pci));
-        assert!(loader.unload(KernelSubsystem::Pci).is_err(), "builtin subsystem must refuse unload");
-
-        // Act & Assert Module Loading
-        assert!(!loader.is_operational(KernelSubsystem::Drm));
-        assert!(loader.load(KernelSubsystem::Drm).is_ok());
-        assert!(loader.is_operational(KernelSubsystem::Drm));
-
-        // Act & Assert Unload
-        assert!(loader.unload(KernelSubsystem::Drm).is_ok());
-        assert!(!loader.is_operational(KernelSubsystem::Drm));
+    fn test_syscall_numbers() {
+        // Arrange / Act / Assert
+        assert_eq!(Syscall::Read as u64, 0);
+        assert_eq!(Syscall::Write as u64, 1);
+        assert_eq!(Syscall::Open as u64, 2);
+        assert_eq!(Syscall::Exit as u64, 60);
+        assert_eq!(Syscall::Getuid as u64, 102);
+        assert_eq!(Syscall::Fork as u64, 57);
+        assert_eq!(Syscall::Getpid as u64, 39);
     }
 }
